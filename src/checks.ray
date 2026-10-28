@@ -1,0 +1,66 @@
+//! Active health checks: one fiber per checked instance, reporting each result to the
+//! registry until the registry closes its `stop` channel.
+
+import std/net;
+import net/http;
+import model;
+
+/// What a check fiber tells the registry. `generation` tells a stale fiber (of a replaced
+/// registration) from the current one.
+pub struct Result_ {
+    service: string,
+    id: string,
+    generation: int,
+    ok: bool,
+    output: string,
+}
+
+pub fn probe(c: model.Check) -> (bool, string) {
+    if (c.kind == "http") {
+        return match (http.request_pairs("GET", c.target, bytes_of([]), [], c.timeout_ms)) {
+            Result.Ok(r) => if (r.status >= 200 && r.status < 300) {
+                (true, "HTTP ${r.status}")
+            } else {
+                (false, "HTTP ${r.status}")
+            },
+            Result.Err(e) => (false, e),
+        };
+    }
+    if (c.kind == "tcp") {
+        let i = match (c.target.last_index_of(":")) {
+            Option.Some(i) => i,
+            Option.None => return (false, "bad tcp target"),
+        };
+        let port = parse_int(c.target.substring(i + 1, c.target.len())).unwrap_or(0);
+        return match (net.tcp_connect_timeout(c.target.substring(0, i), port, c.timeout_ms)) {
+            Result.Ok(h) => {
+                close(h);
+                (true, "TCP connect ok")
+            },
+            Result.Err(e) => (false, e),
+        };
+    }
+    (true, "")
+}
+
+/// Checks right away, then every `interval_ms`, until `stop` is closed.
+pub fn run(
+    service: string,
+    id: string,
+    generation: int,
+    c: model.Check,
+    out: Channel<Result_>,
+    stop: Channel<int>
+) {
+    while (true) {
+        let (ok, output) = probe(c);
+        send(
+            out,
+            Result_ { service: service, id: id, generation: generation, ok: ok, output: output }
+        );
+        match (select_timeout([stop], c.interval_ms)) {
+            Option.Some(_) => return,
+            Option.None => { },
+        }
+    }
+}

@@ -1,0 +1,129 @@
+// The codec against net/dns: its queries parse here, and what we write parses there. Plus
+// compression, truncation, EDNS, broken datagrams and the address parsers.
+
+import net/dns;
+import wire;
+
+fn q_of(name: string, qtype: int) -> wire.Query {
+    wire.parse_query(dns.build_query(4242, name, qtype)).ok().unwrap()
+}
+
+fn rr(name: string, rtype: int, data: wire.Data) -> wire.Rr {
+    wire.Rr { name: name, rtype: rtype, ttl: 5, data: data }
+}
+
+fn answer(rs: [wire.Rr]) -> wire.Answer {
+    wire.Answer {
+        rcode: wire.NOERROR,
+        authoritative: true,
+        answers: rs,
+        authority: [],
+        additional: []
+    }
+}
+
+@test
+fn queries_from_net_dns_parse() {
+    let q = q_of("API.service.ray.internal", wire.A);
+    assert_eq(q.id, 4242);
+    assert_eq(q.question.name, "API.service.ray.internal");
+    assert_eq((q.question.qtype, q.question.qclass), (wire.A, wire.IN));
+    assert_eq(q.edns, 0);
+}
+
+@test
+fn responses_parse_in_net_dns() {
+    let q = q_of("api.service.ray.internal", wire.A);
+    let a = answer(
+        [
+            rr("api.service.ray.internal", wire.A, wire.Data.Addr4([10, 0, 0, 5])),
+            rr("api.service.ray.internal", wire.A, wire.Data.Addr4([10, 0, 0, 6])),
+            rr(
+                "api.service.ray.internal",
+                wire.AAAA,
+                wire.Data.Addr6(wire.parse_ipv6("fd00::7").unwrap())
+            ),
+            rr(
+                "_api._tcp.service.ray.internal",
+                wire.SRV,
+                wire.Data.Srv(1, 1, 8080, "a1.api.instance.ray.internal")
+            ),
+            rr("www.ray.internal", wire.CNAME, wire.Data.Name("api.service.ray.internal")),
+            rr("ray.internal", wire.MX, wire.Data.Mx(10, "mail.ray.internal")),
+            rr("ray.internal", wire.TXT, wire.Data.Txt(["v=spf1 -all", "second"]))
+        ]
+    );
+    let out = wire.write_response(q, a, 0);
+    let got = dns.format_records(dns.parse_records(out).unwrap());
+    assert_eq(got.len(), 7);
+    assert(got[0].contains("10.0.0.5"));
+    assert(got[1].contains("10.0.0.6"));
+    assert(got[2].contains("fd00"));
+    assert(got[3].contains("8080") && got[3].contains("a1.api.instance.ray.internal"));
+    assert(got[4].contains("api.service.ray.internal"));
+    assert(got[5].contains("mail.ray.internal"));
+    assert(got[6].contains("v=spf1 -all"));
+    // Compression: seven records naming the same zone take far less than spelled out.
+    assert(out.len() < 260);
+}
+
+@test
+fn truncation_and_edns() {
+    var rs: [wire.Rr] = [];
+    for i in 0..60 {
+        rs.push(rr("api.service.ray.internal", wire.A, wire.Data.Addr4([10, 0, i / 256, i % 256])));
+    }
+    let plain = q_of("api.service.ray.internal", wire.A);
+    let full = wire.write_response(plain, answer(rs), 0);
+    assert(full.len() > 512);
+    let cut = wire.write_response(plain, answer(rs), wire.udp_limit(plain));
+    assert(cut.len() <= 512);
+    assert((cut[2] & 0x02) != 0);
+    // With EDNS the client offers more room (we cap at 1232).
+    var with_opt: [int] = [];
+    for x in dns.build_query(7, "api.service.ray.internal", wire.A) {
+        with_opt.push(x);
+    }
+    with_opt[11] = 1;
+    with_opt = with_opt + [0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0];
+    let eq = wire.parse_query(bytes_of(with_opt)).ok().unwrap();
+    assert_eq(eq.edns, 4096);
+    assert_eq(wire.udp_limit(eq), 1232);
+    let roomy = wire.write_response(eq, answer(rs), wire.udp_limit(eq));
+    assert_eq((roomy[2] & 0x02), 0);
+    assert_eq(dns.parse_records(roomy).unwrap().len(), 60);
+}
+
+@test
+fn broken_datagrams() {
+    assert_eq(wire.parse_query("short".to_bytes()).is_err(), true);
+    // A pointer that points at itself.
+    let looped = bytes_of([0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xC0, 12, 0, 1, 0, 1]);
+    match (wire.parse_query(looped)) {
+        Result.Err(b) => assert_eq((b.id, b.rcode), (1, wire.FORMERR)),
+        Result.Ok(_) => assert(false),
+    }
+    // Opcode 2 (STATUS).
+    let status = bytes_of([0, 9, 0x10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+    match (wire.parse_query(status)) {
+        Result.Err(b) => {
+            assert_eq(b.rcode, wire.NOTIMP);
+            let reply = wire.write_error(b, status);
+            assert_eq((reply[0], reply[1], reply[3] & 0xF), (0, 9, wire.NOTIMP));
+        },
+        Result.Ok(_) => assert(false),
+    }
+}
+
+@test
+fn addresses() {
+    assert_eq(wire.parse_ipv4("10.0.0.5"), Option.Some([10, 0, 0, 5]));
+    assert(wire.parse_ipv4("10.0.0").is_none());
+    assert(wire.parse_ipv4("10.0.0.256").is_none());
+    assert(wire.parse_ipv4("010.0.0.1").is_none());
+    assert_eq(wire.parse_ipv6("::1").unwrap(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq(wire.parse_ipv6("fd00:0:0:0:0:0:0:7").unwrap(), wire.parse_ipv6("fd00::7").unwrap());
+    assert(wire.parse_ipv6("1:2:3:4:5:6:7:8:9").is_none());
+    assert(wire.parse_ipv6("1::2::3").is_none());
+    assert(wire.parse_ipv6("10.0.0.1").is_none());
+}

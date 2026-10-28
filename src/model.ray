@@ -1,0 +1,76 @@
+//! What the registry holds: service instances, their lease and their check.
+
+/// An active health check: `http` (a 2xx from GET `target`) or `tcp` (a connect to
+/// `target`, HOST:PORT). `kind` is "" for none.
+pub struct Check {
+    kind: string,
+    target: string,
+    interval_ms: int,
+    timeout_ms: int,
+}
+
+pub struct Instance {
+    service: string,
+    id: string,
+    address: string,
+    port: int,
+    tags: [string],
+    /// The lease: the instance must renew within `ttl_ms` (0 = no lease).
+    ttl_ms: int,
+    expires_ms: int,
+    check: Check,
+    check_ok: bool,
+    check_output: string,
+    /// When it last turned unhealthy (0 while healthy).
+    critical_since_ms: int,
+    registered_ms: int,
+}
+
+/// What the DNS side needs, pushed to every receiver on each change: the healthy instances,
+/// and the names of every registered service (so a service with nobody healthy is NODATA, not
+/// NXDOMAIN).
+pub struct View {
+    index: int,
+    healthy: [Instance],
+    services: [string],
+}
+
+pub fn no_check() -> Check {
+    Check { kind: "", target: "", interval_ms: 0, timeout_ms: 0 }
+}
+
+pub fn key(service: string, id: string) -> string {
+    "${service}/${id}"
+}
+
+pub fn lease_ok(i: Instance, now: int) -> bool {
+    i.ttl_ms == 0 || i.expires_ms > now
+}
+
+pub fn healthy(i: Instance, now: int) -> bool {
+    lease_ok(i, now) && (i.check.kind == "" || i.check_ok)
+}
+
+pub fn status(i: Instance, now: int) -> string {
+    if (healthy(i, now)) {
+        "passing"
+    } else if (!lease_ok(i, now)) {
+        "critical: lease expired"
+    } else {
+        "critical: ${i.check_output}"
+    }
+}
+
+/// A DNS label: 1–63 of `a-z`, `0-9` and `-`, not starting or ending with `-`. Service names
+/// and instance ids are labels, so every instance has a name in the zone.
+pub fn valid_label(s: string) -> bool {
+    if (s.len() < 1 || s.len() > 63 || s.starts_with("-") || s.ends_with("-")) {
+        return false;
+    }
+    for c in s.chars() {
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+            return false;
+        }
+    }
+    true
+}

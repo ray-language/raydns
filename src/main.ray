@@ -1,0 +1,241 @@
+//! raydns: service discovery over DNS, with a registry API.
+
+import std/json;
+import std/time;
+import net/http;
+import net/webserver;
+import api;
+import bench;
+import config;
+import server;
+
+const VERSION: string = "0.1.0";
+
+fn usage() -> string {
+    `raydns ${VERSION} — service registry + authoritative DNS
+
+usage:
+  raydns serve [--config raydns.toml]
+  raydns register [--api http://HOST:PORT] [--token T] [--ttl 10s] [--tag T]... [--http-check URL | --tcp-check HOST:PORT]
+                  SERVICE ID ADDRESS:PORT
+                  register, renew the lease until SIGINT/SIGTERM, then deregister
+  raydns ls [--api http://HOST:PORT] [SERVICE]
+  raydns bench HOST:PORT NAME [-n QUERIES] [-c CLIENTS] [--type A|SRV|AAAA]
+                  closed-loop UDP load: queries/s and latency
+`
+}
+
+fn flag(argv: [string], name: string, default: string) -> string {
+    for i in 0..argv.len() {
+        if (argv[i] == name && i + 1 < argv.len()) {
+            return argv[i + 1];
+        }
+    }
+    default
+}
+
+fn flags(argv: [string], name: string) -> [string] {
+    var out: [string] = [];
+    for i in 0..argv.len() {
+        if (argv[i] == name && i + 1 < argv.len()) {
+            out.push(argv[i + 1]);
+        }
+    }
+    out
+}
+
+fn positional(argv: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        if (argv[i].starts_with("-")) {
+            i = i + 2;
+        } else {
+            out.push(argv[i]);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+fn serve(argv: [string]) -> Result<int, string> {
+    let path = flag(argv, "--config", "raydns.toml");
+    let cfg = config.load(path).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    let r = server.start(cfg)?;
+    print(
+        "raydns ${VERSION}: dns udp+tcp ${cfg.dns_host}:${r.dns_port} for ${cfg.zone}, api http://${cfg.http_host}:${r.http_port}, ${cfg.receivers} receivers, ttl ${cfg.ttl}s, ${cfg.records.len()} static record(s)"
+    );
+    let sigs = webserver.shutdown_signals();
+    recv(sigs);
+    let n = server.stop(r);
+    print("raydns: stopped after ${n} queries");
+    Result.Ok(0)
+}
+
+fn api_of(argv: [string]) -> string {
+    flag(argv, "--api", "http://127.0.0.1:8500")
+}
+
+fn auth(argv: [string]) -> [(string, string)] {
+    let t = flag(argv, "--token", "");
+    if (t == "") { [] } else { [("Authorization", "Bearer ${t}")] }
+}
+
+fn call(
+    method: string,
+    url: string,
+    body: string,
+    headers: [(string, string)]
+) -> Result<string, string> {
+    let r = http.request_pairs(
+        method,
+        url,
+        body.to_bytes(),
+        headers + [("Content-Type", "application/json")],
+        5000
+    )?;
+    let text = from_utf8(r.body).unwrap_or("");
+    if (r.status >= 300) {
+        return Result.Err("${method} ${url}: ${r.status} ${text}");
+    }
+    Result.Ok(text)
+}
+
+fn register(argv: [string]) -> Result<int, string> {
+    let pos = positional(argv.slice(1, argv.len()));
+    if (pos.len() != 3) {
+        return Result.Err("register needs SERVICE ID ADDRESS:PORT");
+    }
+    let (address, port) = config.split_addr(pos[2], "ADDRESS:PORT")?;
+    let ttl = flag(argv, "--ttl", "10s");
+    if (api.duration_ms(json.Json.JStr(ttl)).is_none()) {
+        return Result.Err("bad --ttl '${ttl}'");
+    }
+    var pairs: [(string, json.Json)] = [
+        ("address", json.Json.JStr(address)),
+        ("port", json.Json.JNum(port as float)),
+        ("ttl", json.Json.JStr(ttl)),
+        (
+            "tags",
+            json.Json.JArray(
+                flags(argv, "--tag").map(fn(t: string) -> json.Json { json.Json.JStr(t) })
+            )
+        )
+    ];
+    let hc = flag(argv, "--http-check", "");
+    let tc = flag(argv, "--tcp-check", "");
+    if (hc != "" || tc != "") {
+        let m: Map<string, json.Json> = Map.new();
+        m.insert(
+            if (hc != "") { "http" } else { "tcp" },
+            json.Json.JStr(if (hc != "") { hc } else { tc })
+        );
+        m.insert("interval", json.Json.JStr("5s"));
+        pairs.push(("check", json.Json.JObject(m)));
+    }
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, v);
+    }
+    let body = json.stringify(json.Json.JObject(m));
+    let url = "${api_of(argv)}/v1/services/${pos[0]}/${pos[1]}";
+    call("PUT", url, body, auth(argv))?;
+    let ttl_ms = match (api.duration_ms(json.Json.JStr(ttl))) {
+        Option.Some(ms) => if (ms < 300) { 300 } else { ms },
+        Option.None => return Result.Err("bad --ttl '${ttl}'"),
+    };
+    print("raydns: ${pos[0]}/${pos[1]} at ${pos[2]} registered; renewing every ${ttl_ms / 3} ms");
+    let sigs = webserver.shutdown_signals();
+    while (true) {
+        match (select_timeout([sigs], ttl_ms / 3)) {
+            Option.Some(_) => break,
+            Option.None => match (call("PUT", url + "/renew", "", auth(argv))) {
+                Result.Ok(_) => { },
+                // The registry lost it (restart without state, or expired): register again.
+                Result.Err(e) => {
+                    eprint("raydns: renew failed (${e}); registering again");
+                    call("PUT", url, body, auth(argv));
+                },
+            },
+        }
+    }
+    call("DELETE", url, "", auth(argv))?;
+    print("raydns: ${pos[0]}/${pos[1]} deregistered");
+    Result.Ok(0)
+}
+
+fn ls(argv: [string]) -> Result<int, string> {
+    let pos = positional(argv.slice(1, argv.len()));
+    if (pos.len() == 0) {
+        let j = json.parse(call("GET", "${api_of(argv)}/v1/services", "", [])?)?;
+        for s in json.as_array(j)
+            .unwrap_or([]) {
+            print(
+                "${json.get_string(s, "name").unwrap_or("?")}  ${json.get_int(s, "passing").unwrap_or(0)}/${json.get_int(s, "instances").unwrap_or(0)} passing"
+            );
+        }
+        return Result.Ok(0);
+    }
+    let j = json.parse(call("GET", "${api_of(argv)}/v1/services/${pos[0]}", "", [])?)?;
+    for i in json.get_array(j, "instances")
+        .unwrap_or([]) {
+        print(
+            "${json.get_string(i, "id").unwrap_or("?")}  ${json.get_string(i, "address").unwrap_or("?")}:${json.get_int(i, "port").unwrap_or(0)}  ${json.get_string(i, "status").unwrap_or("?")}"
+        );
+    }
+    Result.Ok(0)
+}
+
+fn run_bench(argv: [string]) -> Result<int, string> {
+    let pos = positional(argv.slice(1, argv.len()));
+    if (pos.len() != 2) {
+        return Result.Err("bench needs HOST:PORT NAME");
+    }
+    let (host, port) = config.split_addr(pos[0], "HOST:PORT")?;
+    let qtype = match (flag(argv, "--type", "A").to_upper()) {
+        "A" => 1,
+        "AAAA" => 28,
+        "SRV" => 33,
+        other => return Result.Err("--type ${other}: A, AAAA or SRV"),
+    };
+    let p = bench.Plan {
+        host: host,
+        port: port,
+        name: pos[1],
+        qtype: qtype,
+        total: parse_int(flag(argv, "-n", "100000")).unwrap_or(100000),
+        clients: parse_int(flag(argv, "-c", "8")).unwrap_or(8)
+    };
+    let r = bench.run(p);
+    let qps = if (r.elapsed_ms > 0) { r.answered * 1000 / r.elapsed_ms } else { 0 };
+    print(
+        "${r.answered} answered, ${r.lost} lost in ${r.elapsed_ms} ms: ${qps} queries/s, p50 ${r.p50_us} us, p99 ${r.p99_us} us (${p.clients} clients)"
+    );
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "--help" || argv[0] == "-h") {
+        print(usage());
+        return if (argv.len() == 0) { 2 } else { 0 };
+    }
+    let r = match (argv[0]) {
+        "serve" => serve(argv),
+        "register" => register(argv),
+        "ls" => ls(argv),
+        "bench" => run_bench(argv),
+        "--version" => {
+            print(VERSION);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}'\n\n${usage()}"),
+    };
+    match (r) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint("raydns: ${e}");
+            1
+        },
+    }
+}

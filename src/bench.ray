@@ -1,0 +1,77 @@
+//! A DNS load generator: `clients` fibers, each with its own UDP socket, asking one question
+//! after another (a closed loop: the next query leaves when the answer arrives), for `total`
+//! queries in all. Reports queries/s, latency percentiles and how many got no answer.
+
+import std/time;
+import net/udp;
+import net/dns;
+import std/net;
+
+pub struct Plan {
+    host: string,
+    port: int,
+    name: string,
+    qtype: int,
+    total: int,
+    clients: int,
+}
+
+pub struct Report {
+    answered: int,
+    lost: int,
+    elapsed_ms: int,
+    p50_us: int,
+    p99_us: int,
+}
+
+fn client(p: Plan, n: int, seed: int, out: Channel<(int, [int])>) {
+    let s = udp.bind("0.0.0.0", 0).unwrap();
+    net.set_read_timeout(s, 1000);
+    var lost = 0;
+    var lat: [int] = [];
+    for i in 0..n {
+        let q = dns.build_query((seed * 7919 + i) % 65536, p.name, p.qtype);
+        let t0 = time.monotonic_nanos();
+        udp.send_to(s, p.host, p.port, q);
+        match (udp.recv_from(s)) {
+            Result.Ok(_) => lat.push((time.monotonic_nanos() - t0) / 1000),
+            Result.Err(_) => lost = lost + 1,
+        }
+    }
+    close(s);
+    send(out, (lost, lat));
+}
+
+pub fn run(p: Plan) -> Report {
+    let out: Channel<(int, [int])> = Channel.bounded(p.clients);
+    let each = p.total / p.clients;
+    let t0 = time.now();
+    for c in 0..p.clients {
+        spawn(fn() {
+            client(p, each, c, out);
+        });
+    }
+    var lost = 0;
+    var all: [int] = [];
+    for _ in 0..p.clients {
+        match (recv(out)) {
+            Option.Some((l, lat)) => {
+                lost = lost + l;
+                all = all + lat;
+            },
+            Option.None => { },
+        }
+    }
+    let elapsed = time.now() - t0;
+    let sorted = sort(all);
+    let pct = fn(f: int) -> int {
+        if (sorted.len() == 0) { 0 } else { sorted[(sorted.len() - 1) * f / 100] }
+    };
+    Report {
+        answered: all.len(),
+        lost: lost,
+        elapsed_ms: elapsed,
+        p50_us: pct(50),
+        p99_us: pct(99)
+    }
+}

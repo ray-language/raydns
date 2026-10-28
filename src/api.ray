@@ -1,0 +1,276 @@
+//! The registry over HTTP, in JSON.
+//!
+//! ```
+//! PUT    /v1/services/{service}/{id}          register (or re-register) an instance
+//! PUT    /v1/services/{service}/{id}/renew    renew its lease
+//! DELETE /v1/services/{service}/{id}          deregister it
+//! GET    /v1/services                         every service: instances, passing, index
+//! GET    /v1/services/{service}[?passing=1][&index=N&wait=30s]
+//!                                             its instances; with index, wait for a change
+//! GET    /v1/health                           200 when serving
+//! ```
+//!
+//! Registration body: `{"address": "10.0.0.5", "port": 8080, "tags": ["v2"], "ttl": "15s",
+//! "check": {"http": "http://10.0.0.5:8080/health", "interval": "5s", "timeout": "2s"}}`
+//! (`check.tcp` = "HOST:PORT" instead of `http`; `ttl` and `check` are both optional).
+
+import std/json;
+import std/time;
+import net/webserver;
+import config;
+import model;
+import registry;
+import wire;
+
+pub struct Ctx {
+    cfg: config.Config,
+    reg: Channel<registry.Msg>,
+}
+
+const MAX_WAIT_MS: int = 300000;
+
+fn reply(status: int, j: json.Json) -> webserver.Response {
+    let r = webserver.bytes_response(status, json.stringify(j).to_bytes());
+    r.headers.insert("Content-Type", "application/json");
+    r
+}
+
+fn obj(pairs: [(string, json.Json)]) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, v);
+    }
+    json.Json.JObject(m)
+}
+
+fn error(status: int, message: string) -> webserver.Response {
+    reply(status, obj([("error", json.Json.JStr(message))]))
+}
+
+fn num(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+/// `"15s"`, `"500ms"`, `"2m"`, `"1h"`, or a number of seconds → milliseconds.
+pub fn duration_ms(j: json.Json) -> Option<int> {
+    match (j) {
+        json.Json.JNum(f) => if (f >= 0.0) {
+            Option.Some((f * 1000.0) as int)
+        } else {
+            Option.None
+        },
+        json.Json.JStr(s) => {
+            let (digits, unit) = if (s.ends_with("ms")) {
+                (s.substring(0, s.len() - 2), 1)
+            } else if (s.ends_with("s")) {
+                (s.substring(0, s.len() - 1), 1000)
+            } else if (s.ends_with("m")) {
+                (s.substring(0, s.len() - 1), 60000)
+            } else if (s.ends_with("h")) {
+                (s.substring(0, s.len() - 1), 3600000)
+            } else {
+                (s, 1000)
+            };
+            let n = parse_int(digits)?;
+            if (n < 0 || n > 86400000) { Option.None } else { Option.Some(n * unit) }
+        },
+        _ => Option.None,
+    }
+}
+
+pub fn instance_json(i: model.Instance, now: int) -> json.Json {
+    var pairs: [(string, json.Json)] = [
+        ("service", json.Json.JStr(i.service)),
+        ("id", json.Json.JStr(i.id)),
+        ("address", json.Json.JStr(i.address)),
+        ("port", num(i.port)),
+        ("tags", json.Json.JArray(i.tags.map(fn(t: string) -> json.Json { json.Json.JStr(t) }))),
+        ("status", json.Json.JStr(model.status(i, now))),
+        ("passing", json.Json.JBool(model.healthy(i, now)))
+    ];
+    if (i.ttl_ms > 0) {
+        pairs.push(
+            ("lease_ms_left", num(if (i.expires_ms > now) { i.expires_ms - now } else { 0 }))
+        );
+    }
+    if (i.check.kind != "") {
+        pairs.push(
+            (
+                "check",
+                obj(
+                    [
+                        ("kind", json.Json.JStr(i.check.kind)),
+                        ("target", json.Json.JStr(i.check.target)),
+                        ("output", json.Json.JStr(i.check_output))
+                    ]
+                )
+            )
+        );
+    }
+    obj(pairs)
+}
+
+pub fn handle(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    let parts = req.path.split("/").filter(fn(p: string) -> bool { p != "" });
+    let writes = req.method == "PUT" || req.method == "DELETE";
+    if (writes
+        && ctx.cfg.token != ""
+        && req.headers.get_or("authorization", "") != "Bearer ${ctx.cfg.token}") {
+        return error(401, "a bearer token is required");
+    }
+    let n = parts.len();
+    if (n < 2 || parts[0] != "v1") {
+        return error(404, "no such endpoint");
+    }
+    match ((req.method, parts[1], n)) {
+        ("GET", "health", 2) => reply(200, obj([("status", json.Json.JStr("ok"))])),
+        ("GET", "services", 2) => services(ctx),
+        ("GET", "services", 3) => get_service(ctx, req, parts[2]),
+        ("PUT", "services", 4) => register(ctx, req, parts[2], parts[3]),
+        ("PUT", "services", 5) => if (parts[4] == "renew") {
+            match (registry.ask_renew(ctx.reg, parts[2], parts[3])) {
+                Result.Ok(i) => reply(200, obj([("index", num(i))])),
+                Result.Err(e) => error(404, e),
+            }
+        } else {
+            error(404, "no such endpoint")
+        },
+        ("DELETE", "services", 4) => match (registry.ask_deregister(ctx.reg, parts[2], parts[3])) {
+            Result.Ok(i) => reply(200, obj([("index", num(i))])),
+            Result.Err(e) => error(404, e),
+        },
+        _ => error(405, "method not allowed"),
+    }
+}
+
+fn services(ctx: Ctx) -> webserver.Response {
+    let xs = registry.ask_services(ctx.reg).map(fn(s: registry.Summary) -> json.Json {
+        obj(
+            [
+                ("name", json.Json.JStr(s.name)),
+                ("instances", num(s.instances)),
+                ("passing", num(s.passing)),
+                ("index", num(s.index))
+            ]
+        )
+    });
+    reply(200, json.Json.JArray(xs))
+}
+
+fn get_service(ctx: Ctx, req: webserver.Request, service: string) -> webserver.Response {
+    let q = webserver.query_params(req);
+    let index = parse_int(q.get_or("index", "0")).unwrap_or(0);
+    let wait = match (duration_ms(json.Json.JStr(q.get_or("wait", "30s")))) {
+        Option.Some(ms) => if (ms > MAX_WAIT_MS) { MAX_WAIT_MS } else { ms },
+        Option.None => return error(400, "bad wait"),
+    };
+    let only_passing = q.get_or("passing", "") == "1" || q.get_or("passing", "") == "true";
+    let r = registry.ask_get(ctx.reg, service, index, if (index > 0) { wait } else { 0 });
+    let now = time.now();
+    var xs: [json.Json] = [];
+    for i in r.instances {
+        if (!only_passing || model.healthy(i, now)) {
+            xs.push(instance_json(i, now));
+        }
+    }
+    let resp = reply(200, obj([("index", num(r.index)), ("instances", json.Json.JArray(xs))]));
+    resp.headers.insert("X-Raydns-Index", to_string(r.index));
+    resp
+}
+
+fn register(ctx: Ctx, req: webserver.Request, service: string, id: string) -> webserver.Response {
+    if (!model.valid_label(service) || !model.valid_label(id)) {
+        return error(400, "service and id must be DNS labels: 1-63 of a-z, 0-9 and -");
+    }
+    let body = match (webserver.request_text(req)) {
+        Result.Ok(t) => t,
+        Result.Err(_) => return error(400, "the body is not UTF-8"),
+    };
+    let j = match (json.parse(body)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => return error(400, "bad JSON: ${e}"),
+    };
+    let address = json.get_string(j, "address").unwrap_or("");
+    if (wire.parse_ipv4(address).is_none() && wire.parse_ipv6(address).is_none()) {
+        return error(400, "address must be an IPv4 or IPv6 address");
+    }
+    let port = json.get_int(j, "port").unwrap_or(-1);
+    if (port < 1 || port > 65535) {
+        return error(400, "port must be 1-65535");
+    }
+    var tags: [string] = [];
+    for t in json.get_array(j, "tags").unwrap_or([]) {
+        match (json.as_string(t)) {
+            Option.Some(s) => if (model.valid_label(s)) {
+                tags.push(s);
+            } else {
+                return error(400, "tag '${s}' is not a DNS label");
+            },
+            Option.None => return error(400, "tags must be strings"),
+        }
+    }
+    let ttl_ms = match (json.member(j, "ttl")) {
+        Option.Some(t) => match (duration_ms(t)) {
+            Option.Some(ms) => ms,
+            Option.None => return error(400, "bad ttl"),
+        },
+        Option.None => 0,
+    };
+    let check = match (json.member(j, "check")) {
+        Option.Some(c) => match (check_of(c)) {
+            Result.Ok(c) => c,
+            Result.Err(e) => return error(400, e),
+        },
+        Option.None => model.no_check(),
+    };
+    let i = model.Instance {
+        service: service,
+        id: id,
+        address: address,
+        port: port,
+        tags: tags,
+        ttl_ms: ttl_ms,
+        expires_ms: 0,
+        check: check,
+        check_ok: false,
+        check_output: "not checked yet",
+        critical_since_ms: 0,
+        registered_ms: 0
+    };
+    match (registry.ask_register(ctx.reg, i)) {
+        Result.Ok(n) => reply(200, obj([("index", num(n))])),
+        Result.Err(e) => error(500, e),
+    }
+}
+
+fn check_of(c: json.Json) -> Result<model.Check, string> {
+    let interval = duration_ms(json.member(c, "interval").unwrap_or(json.Json.JStr("10s"))).unwrap_or(
+        -1
+    );
+    let timeout = duration_ms(json.member(c, "timeout").unwrap_or(json.Json.JStr("2s"))).unwrap_or(
+        -1
+    );
+    if (interval < 100 || timeout < 1) {
+        return Result.Err("check interval must be at least 100ms and timeout positive");
+    }
+    match (json.get_string(c, "http")) {
+        Option.Some(u) => if (u.starts_with("http://") || u.starts_with("https://")) {
+            return Result.Ok(
+                model.Check { kind: "http", target: u, interval_ms: interval, timeout_ms: timeout }
+            );
+        } else {
+            return Result.Err("check.http must be an http(s) URL");
+        },
+        Option.None => { },
+    }
+    match (json.get_string(c, "tcp")) {
+        Option.Some(t) => if (t.contains(":")) {
+            Result.Ok(
+                model.Check { kind: "tcp", target: t, interval_ms: interval, timeout_ms: timeout }
+            )
+        } else {
+            Result.Err("check.tcp must be HOST:PORT")
+        },
+        Option.None => Result.Err("check needs http or tcp"),
+    }
+}

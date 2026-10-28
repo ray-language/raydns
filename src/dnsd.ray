@@ -1,0 +1,140 @@
+//! The DNS server: UDP receivers on one socket, each with its own copy of the registry's view
+//! (pushed on every change, so answering never asks anyone), and TCP on the same port for
+//! answers that do not fit a datagram.
+
+import std/net;
+import net/udp;
+import model;
+import registry;
+import wire;
+import zone;
+
+/// Counters a receiver keeps and reports when it stops.
+pub struct Stats {
+    queries: int,
+    errors: int,
+}
+
+/// Answers one datagram or TCP message; `None` = drop it (not even a header to reply to).
+pub fn answer(z: zone.Zone, v: model.View, data: bytes, udp: bool) -> Option<bytes> {
+    match (wire.parse_query(data)) {
+        Result.Ok(q) => {
+            let a = zone.resolve(z, v, q.question);
+            Option.Some(wire.write_response(q, a, if (udp) { wire.udp_limit(q) } else { 0 }))
+        },
+        Result.Err(bad) => if (bad.id == 0 && bad.rcode == wire.FORMERR && data.len() < 12) {
+            Option.None
+        } else {
+            Option.Some(wire.write_error(bad, data))
+        },
+    }
+}
+
+fn newest(views: Channel<model.View>, v: model.View) -> model.View {
+    var out = v;
+    while (true) {
+        match (try_recv(views)) {
+            Received.Got(nv) => out = nv,
+            _ => return out,
+        }
+    }
+}
+
+/// One UDP receiver. It reads with a short timeout so it notices a new view or `stop`
+/// (closed) between datagrams even when none arrive.
+pub fn receive(
+    sock: int,
+    z: zone.Zone,
+    reg: Channel<registry.Msg>,
+    stop: Channel<int>,
+    done: Channel<Stats>
+) {
+    let views = registry.subscribe(reg);
+    var v = recv(views).unwrap_or(model.View { index: 0, healthy: [], services: [] });
+    var st = Stats { queries: 0, errors: 0 };
+    while (true) {
+        match (try_recv(stop)) {
+            Received.Empty => { },
+            _ => {
+                send(done, st);
+                return;
+            },
+        }
+        match (udp.recv_from(sock)) {
+            Result.Ok(p) => {
+                // The newest view, taken after the datagram arrived: the wait for it may have
+                // been long enough for the registry to change.
+                v = newest(views, v);
+                st.queries = st.queries + 1;
+                match (answer(z, v, p.data, true)) {
+                    Option.Some(out) => match (udp.send_to(sock, p.host, p.port, out)) {
+                        Result.Ok(_) => { },
+                        Result.Err(_) => st.errors = st.errors + 1,
+                    },
+                    Option.None => st.errors = st.errors + 1,
+                }
+            },
+            Result.Err(_) => { },
+        }
+    }
+}
+
+/// Accepts TCP connections until the listener is closed.
+pub fn accept_tcp(listener: int, z: zone.Zone, reg: Channel<registry.Msg>) {
+    while (true) {
+        match (net.tcp_accept(listener)) {
+            Result.Ok(c) => {
+                spawn(fn() {
+                    serve_tcp(c, z, reg);
+                });
+            },
+            Result.Err(_) => return,
+        }
+    }
+}
+
+const TCP_IDLE_MS: int = 10000;
+
+// RFC 7766: two-octet length, then the message; several per connection.
+fn serve_tcp(c: int, z: zone.Zone, reg: Channel<registry.Msg>) {
+    net.set_read_timeout(c, TCP_IDLE_MS);
+    let v = registry.snapshot(reg);
+    var buf = bytes_of([]);
+    while (true) {
+        while (buf.len() >= 2) {
+            let n = (buf[0] << 8) | buf[1];
+            if (buf.len() < 2 + n) {
+                break;
+            }
+            let msg = buf.sub_bytes(2, 2 + n);
+            buf = buf.sub_bytes(2 + n, buf.len());
+            match (answer(z, v, msg, false)) {
+                Option.Some(out) => {
+                    let framed = bytes_concat(
+                        [bytes_of([(out.len() >> 8) & 0xFF, out.len() & 0xFF]), out]
+                    );
+                    match (net.socket_write_bytes(c, framed)) {
+                        Result.Ok(_) => { },
+                        Result.Err(_) => {
+                            close(c);
+                            return;
+                        },
+                    }
+                },
+                Option.None => {
+                    close(c);
+                    return;
+                },
+            }
+        }
+        match (net.socket_read_bytes(c)) {
+            Result.Ok(more) => if (more.len() == 0) {
+                break;
+            } else {
+                buf = bytes_concat([buf, more]);
+            },
+            Result.Err(_) => break,
+        }
+    }
+    close(c);
+}

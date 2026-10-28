@@ -1,0 +1,123 @@
+// The registry fiber: leases, blocking reads, views pushed to subscribers, automatic removal,
+// TCP checks against a listener of our own, and a restart from the saved file.
+
+import std/fs;
+import std/net;
+import std/time;
+import model;
+import registry;
+
+fn inst(service: string, id: string, ttl_ms: int, check: model.Check) -> model.Instance {
+    model.Instance {
+        service: service,
+        id: id,
+        address: "10.0.0.1",
+        port: 80,
+        tags: [],
+        ttl_ms: ttl_ms,
+        expires_ms: 0,
+        check: check,
+        check_ok: false,
+        check_output: "",
+        critical_since_ms: 0,
+        registered_ms: 0
+    }
+}
+
+fn passing(reg: Channel<registry.Msg>, service: string) -> int {
+    var n = 0;
+    for s in registry.ask_services(reg) {
+        if (s.name == service) {
+            n = s.passing;
+        }
+    }
+    n
+}
+
+// Polls `passing` until it is `want` or `ms` pass.
+fn until_passing(reg: Channel<registry.Msg>, service: string, want: int, ms: int) -> bool {
+    let end = time.now() + ms;
+    while (time.now() < end) {
+        if (passing(reg, service) == want) {
+            return true;
+        }
+        time.sleep(20);
+    }
+    false
+}
+
+@test
+fn leases_blocking_reads_and_views() {
+    let reg = registry.start("", 400).unwrap();
+    let views = registry.subscribe(reg);
+    assert_eq(recv(views).unwrap().healthy.len(), 0);
+
+    let i1 = registry.ask_register(reg, inst("api", "a1", 300, model.no_check())).unwrap();
+    assert_eq(passing(reg, "api"), 1);
+    // The subscriber sees the change.
+    var v = recv(views).unwrap();
+    assert_eq((v.healthy.len(), v.services), (1, ["api"]));
+
+    // Re-registering the same thing is a renewal: no new index.
+    assert_eq(registry.ask_register(reg, inst("api", "a1", 300, model.no_check())).unwrap(), i1);
+
+    // A blocking read wakes when the service changes, not before.
+    let t0 = time.now();
+    let woke: Channel<registry.Reply> = Channel.bounded(1);
+    spawn(fn() {
+        send(woke, registry.ask_get(reg, "api", i1, 5000));
+    });
+    time.sleep(50);
+    registry.ask_register(reg, inst("api", "a2", 0, model.no_check()));
+    let r = recv(woke).unwrap();
+    assert(r.index > i1);
+    assert_eq(r.instances.len(), 2);
+    assert(time.now() - t0 < 2000);
+    // Nothing changes: the read returns at its deadline with the same index.
+    let idle = registry.ask_get(reg, "api", r.index, 150);
+    assert_eq(idle.index, r.index);
+
+    // a1 stops renewing: critical after its lease, gone after deregister_after (400 ms).
+    assert(until_passing(reg, "api", 1, 1000));
+    let end = time.now() + 2000;
+    var count = 2;
+    while (time.now() < end && count == 2) {
+        count = registry.ask_get(reg, "api", 0, 0).instances.len();
+        time.sleep(20);
+    }
+    assert_eq(count, 1);
+    assert(registry.ask_renew(reg, "api", "a1").is_err());
+    assert(registry.ask_deregister(reg, "api", "a2").is_ok());
+    assert_eq(registry.ask_get(reg, "api", 0, 0).instances.len(), 0);
+    registry.stop(reg);
+}
+
+@test
+fn tcp_checks_and_restart() {
+    let path = fs.make_temp_dir("raydns-reg").unwrap() + "/state.json";
+    let reg = registry.start(path, 60000).unwrap();
+    let l = net.tcp_listen("127.0.0.1", 0).unwrap();
+    let port = net.local_port(l);
+    let check = model.Check {
+        kind: "tcp",
+        target: "127.0.0.1:${port}",
+        interval_ms: 50,
+        timeout_ms: 500
+    };
+    registry.ask_register(reg, inst("db", "d1", 0, check));
+    assert(until_passing(reg, "db", 1, 2000));
+    // The listener goes away: the check fails and the instance turns critical.
+    close(l);
+    assert(until_passing(reg, "db", 0, 2000));
+    let out = registry.ask_get(reg, "db", 0, 0).instances[0];
+    assert(model.status(out, time.now()).starts_with("critical: "));
+    registry.ask_register(reg, inst("web", "w1", 0, model.no_check()));
+    registry.stop(reg);
+
+    // Back from the file: both instances, the index where it was.
+    let reg2 = registry.start(path, 60000).unwrap();
+    let names = registry.ask_services(reg2).map(fn(s: registry.Summary) -> string { s.name });
+    assert_eq(names, ["db", "web"]);
+    assert_eq(passing(reg2, "web"), 1);
+    registry.stop(reg2);
+}

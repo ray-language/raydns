@@ -1,0 +1,155 @@
+//! `raydns.toml`: where to listen, the zone, and its static records.
+//!
+//! ```toml
+//! [server]
+//! dns = "127.0.0.1:8600"        # UDP and TCP, same port
+//! http = "127.0.0.1:8500"       # the registry API
+//! zone = "ray.internal"
+//! advertise = "127.0.0.1"       # the address of ns.<zone>
+//! ttl = 5                       # seconds, for service answers
+//! deregister_after = 60         # seconds an unhealthy instance stays listed
+//! receivers = 4                 # UDP fibers on the DNS socket
+//! state = "raydns.state.json"   # where the registry is saved ("" = nowhere)
+//! token = ""                    # bearer token for writes to the API ("" = open)
+//!
+//! [[record]]
+//! name = "www"                  # relative to the zone; "@" is the zone itself
+//! type = "CNAME"                # A, AAAA, CNAME, TXT, MX ("10 mail.example.com")
+//! value = "web.service.ray.internal"
+//! ttl = 300
+//! ```
+
+import std/fs;
+import std/toml;
+import wire;
+
+pub struct Static {
+    /// Lowercased, absolute, without the final dot.
+    name: string,
+    rtype: int,
+    value: string,
+    ttl: int,
+}
+
+pub struct Config {
+    dns_host: string,
+    dns_port: int,
+    http_host: string,
+    http_port: int,
+    zone: string,
+    advertise: string,
+    ttl: int,
+    deregister_after_ms: int,
+    receivers: int,
+    state: string,
+    token: string,
+    records: [Static],
+}
+
+pub fn defaults() -> Config {
+    Config {
+        dns_host: "127.0.0.1",
+        dns_port: 8600,
+        http_host: "127.0.0.1",
+        http_port: 8500,
+        zone: "ray.internal",
+        advertise: "127.0.0.1",
+        ttl: 5,
+        deregister_after_ms: 60000,
+        receivers: 4,
+        state: "raydns.state.json",
+        token: "",
+        records: []
+    }
+}
+
+pub fn load(path: string) -> Result<Config, string> {
+    parse(fs.read_file(path)?)
+}
+
+fn str_of(e: [toml.TomlEntry], key: string, default: string) -> Result<string, string> {
+    match (toml.toml_get(e, key)) {
+        Option.Some(toml.TomlValue.TStr(s)) => Result.Ok(s),
+        Option.Some(_) => Result.Err("${key} must be a string"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+fn int_of(e: [toml.TomlEntry], key: string, default: int) -> Result<int, string> {
+    match (toml.toml_get(e, key)) {
+        Option.Some(toml.TomlValue.TInt(n)) => Result.Ok(n),
+        Option.Some(_) => Result.Err("${key} must be an integer"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+pub fn split_addr(s: string, what: string) -> Result<(string, int), string> {
+    match (s.last_index_of(":")) {
+        Option.Some(i) => match (parse_int(s.substring(i + 1, s.len()))) {
+            Option.Some(p) => Result.Ok((s.substring(0, i), p)),
+            Option.None => Result.Err("${what}: bad port in '${s}'"),
+        },
+        Option.None => Result.Err("${what} must be HOST:PORT"),
+    }
+}
+
+pub fn parse(src: string) -> Result<Config, string> {
+    let e = toml.parse_toml(src)?;
+    var c = defaults();
+    let (dh, dp) = split_addr(
+        str_of(e, "server.dns", "${c.dns_host}:${c.dns_port}")?,
+        "server.dns"
+    )?;
+    c.dns_host = dh;
+    c.dns_port = dp;
+    let (hh, hp) = split_addr(
+        str_of(e, "server.http", "${c.http_host}:${c.http_port}")?,
+        "server.http"
+    )?;
+    c.http_host = hh;
+    c.http_port = hp;
+    c.zone = str_of(e, "server.zone", c.zone)?.to_lower().strip_suffix(".").unwrap_or(c.zone);
+    c.advertise = str_of(e, "server.advertise", c.advertise)?;
+    if (wire.parse_ipv4(c.advertise).is_none() && wire.parse_ipv6(c.advertise).is_none()) {
+        return Result.Err("server.advertise must be an IP address");
+    }
+    c.ttl = int_of(e, "server.ttl", c.ttl)?;
+    c.deregister_after_ms = int_of(e, "server.deregister_after", 60)? * 1000;
+    c.receivers = int_of(e, "server.receivers", c.receivers)?;
+    c.state = str_of(e, "server.state", c.state)?;
+    c.token = str_of(e, "server.token", c.token)?;
+    for i in 0..toml.toml_array_len(
+        e,
+        "record"
+    ) {
+        let p = "record.${i}";
+        let name = str_of(e, "${p}.name", "")?.to_lower();
+        if (name == "") {
+            return Result.Err("[[record]] number ${i + 1} needs a name");
+        }
+        let full = if (name == "@") { c.zone } else { "${name}.${c.zone}" };
+        let t = str_of(e, "${p}.type", "")?.to_upper();
+        let rtype = match (t) {
+            "A" => wire.A,
+            "AAAA" => wire.AAAA,
+            "CNAME" => wire.CNAME,
+            "TXT" => wire.TXT,
+            "MX" => wire.MX,
+            _ => return Result.Err("[[record]] ${name}: type '${t}' is not one of A, AAAA, CNAME, TXT, MX"),
+        };
+        let value = str_of(e, "${p}.value", "")?;
+        let ok = match (rtype) {
+            1 => wire.parse_ipv4(value).is_some(),
+            28 => wire.parse_ipv6(value).is_some(),
+            15 => value.split(" ").len() == 2 && parse_int(value.split(" ")[0]).is_some(),
+            _ => value != "",
+        };
+        if (!ok) {
+            return Result.Err("[[record]] ${name}: '${value}' is not a valid ${t} value");
+        }
+        c.records.push(
+            Static { name: full, rtype: rtype, value: value, ttl: int_of(e, "${p}.ttl", 300)? }
+        );
+    }
+    Result.Ok(c)
+}

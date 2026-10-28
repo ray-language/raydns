@@ -1,0 +1,141 @@
+// The service end to end, in one test (OS listeners outlive a test's fibers): registration over
+// HTTP, answers over UDP and TCP with the net/dns client, a lease running out, a blocking read,
+// and the registry back after a restart.
+
+import std/fs;
+import std/json;
+import std/net;
+import std/time;
+import net/dns;
+import net/http;
+import config;
+import server;
+
+fn boot(state: string) -> server.Running {
+    let src = `
+[server]
+dns = "127.0.0.1:0"
+http = "127.0.0.1:0"
+zone = "ray.internal"
+state = "${state}"
+receivers = 2
+
+[[record]]
+name = "www"
+type = "CNAME"
+value = "api.service.ray.internal"
+`;
+    server.start(config.parse(src).unwrap()).unwrap()
+}
+
+fn put(r: server.Running, path: string, body: string) -> int {
+    http.request_pairs("PUT", "http://127.0.0.1:${r.http_port}${path}", body.to_bytes(), [], 5000)
+        .unwrap().status
+}
+
+fn get_json(r: server.Running, path: string) -> json.Json {
+    let resp = http.request_pairs("GET", "http://127.0.0.1:${r.http_port}${path}", bytes_of([]), [], 15000)
+        .unwrap();
+    json.parse(from_utf8(resp.body).unwrap()).unwrap()
+}
+
+// The A records only: query_a also returns the target of a CNAME (finding).
+fn a(r: server.Running, name: string) -> [string] {
+    var out: [string] = [];
+    for rec in dns.query("127.0.0.1", r.dns_port, name, 1).unwrap_or([]) {
+        match (rec) {
+            dns.Record.A(ip) => out.push(ip),
+            _ => { },
+        }
+    }
+    sort(out)
+}
+
+// One DNS question over TCP, framed by hand.
+fn tcp_a(r: server.Running, name: string) -> [string] {
+    let c = net.tcp_connect("127.0.0.1", r.dns_port).unwrap();
+    net.set_read_timeout(c, 3000);
+    let q = dns.build_query(77, name, 1);
+    net.socket_write_bytes(c, bytes_concat([bytes_of([0, q.len()]), q])).unwrap();
+    var buf = bytes_of([]);
+    while (buf.len() < 2 || buf.len() < 2 + ((buf[0] << 8) | buf[1])) {
+        let more = net.socket_read_bytes(c).unwrap();
+        if (more.len() == 0) {
+            break;
+        }
+        buf = bytes_concat([buf, more]);
+    }
+    close(c);
+    var out: [string] = [];
+    for rec in dns.parse_records(buf.sub_bytes(2, buf.len())).unwrap() {
+        match (rec) {
+            dns.Record.A(ip) => out.push(ip),
+            _ => { },
+        }
+    }
+    sort(out)
+}
+
+@test
+fn registry_and_dns_end_to_end() {
+    let state = fs.make_temp_dir("raydns-e2e").unwrap() + "/state.json";
+    let r = boot(state);
+    assert_eq(
+        put(r, "/v1/services/api/a1", `{"address": "10.0.0.1", "port": 8080, "tags": ["v1"]}`),
+        200
+    );
+    assert_eq(
+        put(r, "/v1/services/api/a2", `{"address": "10.0.0.2", "port": 8081, "tags": ["v2"]}`),
+        200
+    );
+    assert_eq(put(r, "/v1/services/Bad/a3", `{"address": "10.0.0.3", "port": 1}`), 400);
+    assert_eq(put(r, "/v1/services/api/a3", `{"address": "nowhere", "port": 1}`), 400);
+    time.sleep(50);
+
+    assert_eq(a(r, "api.service.ray.internal"), ["10.0.0.1", "10.0.0.2"]);
+    assert_eq(a(r, "v2.api.service.ray.internal"), ["10.0.0.2"]);
+    assert_eq(a(r, "www.ray.internal"), ["10.0.0.1", "10.0.0.2"]);
+    assert_eq(tcp_a(r, "api.service.ray.internal"), ["10.0.0.1", "10.0.0.2"]);
+    let srv = dns.query_srv("127.0.0.1", r.dns_port, "_api._tcp.service.ray.internal").unwrap();
+    assert_eq(srv.len(), 2);
+    assert(
+        dns.query_a("127.0.0.1", r.dns_port, "nope.service.ray.internal").unwrap_or([]).len() == 0
+    );
+
+    // A lease of 300 ms, never renewed: gone from DNS soon after.
+    assert_eq(
+        put(r, "/v1/services/api/a9", `{"address": "10.0.0.9", "port": 80, "ttl": "300ms"}`),
+        200
+    );
+    time.sleep(50);
+    assert_eq(a(r, "api.service.ray.internal").len(), 3);
+    time.sleep(500);
+    assert_eq(a(r, "api.service.ray.internal"), ["10.0.0.1", "10.0.0.2"]);
+
+    // A blocking read returns when the service changes.
+    let idx = json.get_int(get_json(r, "/v1/services/api"), "index").unwrap();
+    let port = r.http_port;
+    spawn(fn() {
+        time.sleep(100);
+        http.request_pairs(
+            "DELETE",
+            "http://127.0.0.1:${port}/v1/services/api/a2",
+            bytes_of([]),
+            [],
+            5000
+        );
+    });
+    let t0 = time.now();
+    let after = get_json(r, "/v1/services/api?passing=1&index=${idx}&wait=10s");
+    assert(time.now() - t0 < 5000);
+    assert(json.get_int(after, "index").unwrap() > idx);
+    assert_eq(json.get_array(after, "instances").unwrap().len(), 1);
+    let n = server.stop(r);
+    assert(n >= 7);
+
+    // Back from the saved registry.
+    let r2 = boot(state);
+    time.sleep(50);
+    assert_eq(a(r2, "api.service.ray.internal"), ["10.0.0.1"]);
+    server.stop(r2);
+}

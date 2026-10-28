@@ -1,0 +1,560 @@
+//! The registry: one fiber owns every instance, its lease and its health. The API asks it over
+//! a channel; the DNS fibers subscribe and get a fresh `View` after every change, so a DNS
+//! query never waits on the registry.
+//!
+//! Each change bumps a global index, and the service's own index. A blocking read
+//! (`Get` with an index) parks until that service's index moves past it, or its deadline.
+
+import std/fs;
+import std/json;
+import std/time;
+import checks;
+import model;
+
+pub struct Reply {
+    index: int,
+    instances: [model.Instance],
+}
+
+pub struct Summary {
+    name: string,
+    instances: int,
+    passing: int,
+    index: int,
+}
+
+pub enum Msg {
+    Register(model.Instance, Channel<Result<int, string>>),
+    Renew(string, string, Channel<Result<int, string>>),
+    Deregister(string, string, Channel<Result<int, string>>),
+    /// Service, the index the caller has seen (0 = answer now), and a deadline (ms epoch).
+    Get(string, int, int, Channel<Reply>),
+    Services(Channel<[Summary]>),
+    Subscribe(Channel<model.View>),
+    /// The current view, once (for a TCP connection, which does not stay subscribed).
+    Snapshot(Channel<model.View>),
+    Stop(Channel<int>),
+}
+
+struct Waiter {
+    service: string,
+    index: int,
+    deadline: int,
+    reply: Channel<Reply>,
+}
+
+struct State {
+    instances: Map<string, model.Instance>,
+    generation: Map<string, int>,
+    stops: Map<string, Channel<int>>,
+    service_index: Map<string, int>,
+    index: int,
+    waiters: [Waiter],
+    subscribers: [Channel<model.View>],
+    view_stale: bool,
+    dirty: bool,
+    saved_ms: int,
+    path: string,
+    deregister_after_ms: int,
+    results: Channel<checks.Result_>,
+}
+
+const TICK_MS: int = 100;
+
+const SAVE_EVERY_MS: int = 1000;
+
+pub fn start(path: string, deregister_after_ms: int) -> Result<Channel<Msg>, string> {
+    let loaded = if (path != "" && fs.exists(path)) { load(path)? } else { (0, []) };
+    let inbox: Channel<Msg> = Channel.bounded(1024);
+    spawn(fn() {
+        let (index, saved) = loaded;
+        let s = State {
+            instances: Map.new(),
+            generation: Map.new(),
+            stops: Map.new(),
+            service_index: Map.new(),
+            index: index,
+            waiters: [],
+            subscribers: [],
+            view_stale: false,
+            dirty: false,
+            saved_ms: 0,
+            path: path,
+            deregister_after_ms: deregister_after_ms,
+            results: Channel.new()
+        };
+        for i in saved {
+            s.instances.insert(model.key(i.service, i.id), i);
+            s.service_index.insert(i.service, index);
+            start_check(s, i);
+        }
+        serve(s, inbox);
+    });
+    Result.Ok(inbox)
+}
+
+fn serve(s: State, inbox: Channel<Msg>) {
+    var last_tick = 0;
+    while (true) {
+        match (select_timeout([inbox], TICK_MS)) {
+            Option.Some(_) => match (recv(inbox)) {
+                Option.Some(m) => if (!handle(s, m)) {
+                    return;
+                },
+                Option.None => return,
+            },
+            Option.None => { },
+        }
+        drain_results(s);
+        let now = time.now();
+        if (now - last_tick >= TICK_MS) {
+            tick(s, now);
+            last_tick = now;
+        }
+        if (s.view_stale) {
+            push_view(s);
+        }
+    }
+}
+
+// false = stop.
+fn handle(s: State, m: Msg) -> bool {
+    match (m) {
+        Msg.Register(i, reply) => {
+            let r = register(s, i);
+            send(reply, r);
+        },
+        Msg.Renew(service, id, reply) => {
+            let r = renew(s, service, id);
+            send(reply, r);
+        },
+        Msg.Deregister(service, id, reply) => {
+            let r = deregister(s, service, id);
+            send(reply, r);
+        },
+        Msg.Get(service, index, deadline, reply) => {
+            if (index > 0 && service_index(s, service) <= index && deadline > time.now()) {
+                s.waiters.push(
+                    Waiter { service: service, index: index, deadline: deadline, reply: reply }
+                );
+            } else {
+                send(reply, reply_of(s, service));
+            }
+        },
+        Msg.Services(reply) => send(reply, summaries(s)),
+        Msg.Subscribe(ch) => {
+            s.subscribers.push(ch);
+            send(ch, view_of(s));
+        },
+        Msg.Snapshot(ch) => send(ch, view_of(s)),
+        Msg.Stop(reply) => {
+            for k in s.stops.keys() {
+                close(s.stops.get(k).unwrap());
+            }
+            save(s);
+            send(reply, 0);
+            return false;
+        },
+    }
+    true
+}
+
+fn service_index(s: State, service: string) -> int {
+    s.service_index.get_or(service, 0)
+}
+
+fn reply_of(s: State, service: string) -> Reply {
+    var xs: [model.Instance] = [];
+    for k in sort(s.instances.keys()) {
+        let i = s.instances.get(k).unwrap();
+        if (i.service == service) {
+            xs.push(i);
+        }
+    }
+    Reply {
+        index: if (service_index(s, service) == 0) { s.index } else { service_index(s, service) },
+        instances: xs
+    }
+}
+
+// A change visible from outside: indexes, waiters, the DNS view, the file.
+fn bump(s: State, service: string) {
+    s.index = s.index + 1;
+    s.service_index.insert(service, s.index);
+    s.view_stale = true;
+    s.dirty = true;
+    var keep: [Waiter] = [];
+    for w in s.waiters {
+        if (w.service == service) {
+            send(w.reply, reply_of(s, service));
+        } else {
+            keep.push(w);
+        }
+    }
+    s.waiters = keep;
+}
+
+fn same_check(a: model.Check, b: model.Check) -> bool {
+    a.kind == b.kind
+        && a.target == b.target
+        && a.interval_ms == b.interval_ms
+        && a.timeout_ms == b.timeout_ms
+}
+
+fn register(s: State, i: model.Instance) -> Result<int, string> {
+    let k = model.key(i.service, i.id);
+    let now = time.now();
+    i.expires_ms = if (i.ttl_ms > 0) { now + i.ttl_ms } else { 0 };
+    i.registered_ms = now;
+    match (s.instances.get(k)) {
+        Option.Some(old) => {
+            let unchanged = old.address == i.address
+                && old.port == i.port
+                && old.tags == i.tags
+                && old.ttl_ms == i.ttl_ms
+                && same_check(old.check, i.check);
+            if (unchanged) {
+                // Re-registering the same thing is a renewal.
+                old.expires_ms = i.expires_ms;
+                refresh(s, k, now);
+                return Result.Ok(s.index);
+            }
+            i.registered_ms = old.registered_ms;
+            if (same_check(old.check, i.check)) {
+                i.check_ok = old.check_ok;
+                i.check_output = old.check_output;
+            }
+        },
+        Option.None => { },
+    }
+    i.critical_since_ms = if (model.healthy(i, now)) { 0 } else { now };
+    let restart = match (s.instances.get(k)) {
+        Option.Some(old) => !same_check(old.check, i.check),
+        Option.None => true,
+    };
+    s.instances.insert(k, i);
+    if (restart) {
+        stop_check(s, k);
+        start_check(s, i);
+    }
+    bump(s, i.service);
+    Result.Ok(s.index)
+}
+
+fn renew(s: State, service: string, id: string) -> Result<int, string> {
+    let k = model.key(service, id);
+    match (s.instances.get(k)) {
+        Option.Some(i) => {
+            if (i.ttl_ms > 0) {
+                i.expires_ms = time.now() + i.ttl_ms;
+            }
+            refresh(s, k, time.now());
+            Result.Ok(s.index)
+        },
+        Option.None => Result.Err("unknown instance"),
+    }
+}
+
+fn deregister(s: State, service: string, id: string) -> Result<int, string> {
+    let k = model.key(service, id);
+    if (!s.instances.contains_key(k)) {
+        return Result.Err("unknown instance");
+    }
+    s.instances.remove(k);
+    stop_check(s, k);
+    bump(s, service);
+    Result.Ok(s.index)
+}
+
+// Recomputes the health of one instance; a flip is a change.
+fn refresh(s: State, k: string, now: int) {
+    match (s.instances.get(k)) {
+        Option.Some(i) => {
+            let was = i.critical_since_ms == 0;
+            let is = model.healthy(i, now);
+            if (was != is) {
+                i.critical_since_ms = if (is) { 0 } else { now };
+                bump(s, i.service);
+            }
+        },
+        Option.None => { },
+    }
+}
+
+fn start_check(s: State, i: model.Instance) {
+    if (i.check.kind == "") {
+        return;
+    }
+    let k = model.key(i.service, i.id);
+    let generation = s.generation.get_or(k, 0) + 1;
+    s.generation.insert(k, generation);
+    let stop: Channel<int> = Channel.bounded(1);
+    s.stops.insert(k, stop);
+    let results = s.results;
+    let service = i.service;
+    let id = i.id;
+    let check = i.check;
+    spawn(fn() {
+        checks.run(service, id, generation, check, results, stop);
+    });
+}
+
+fn stop_check(s: State, k: string) {
+    match (s.stops.get(k)) {
+        Option.Some(ch) => {
+            close(ch);
+            s.stops.remove(k);
+        },
+        Option.None => { },
+    }
+}
+
+fn drain_results(s: State) {
+    while (true) {
+        match (try_recv(s.results)) {
+            Received.Got(r) => {
+                let k = model.key(r.service, r.id);
+                if (s.generation.get_or(k, 0) == r.generation) {
+                    match (s.instances.get(k)) {
+                        Option.Some(i) => {
+                            i.check_ok = r.ok;
+                            i.check_output = r.output;
+                            refresh(s, k, time.now());
+                        },
+                        Option.None => { },
+                    }
+                }
+            },
+            _ => return,
+        }
+    }
+}
+
+fn tick(s: State, now: int) {
+    for k in s.instances.keys() {
+        refresh(s, k, now);
+    }
+    // Unhealthy for too long: gone.
+    for k in s.instances.keys() {
+        let i = s.instances.get(k).unwrap();
+        if (i.critical_since_ms > 0 && now - i.critical_since_ms > s.deregister_after_ms) {
+            deregister(s, i.service, i.id);
+        }
+    }
+    var keep: [Waiter] = [];
+    for w in s.waiters {
+        if (w.deadline <= now) {
+            send(w.reply, reply_of(s, w.service));
+        } else {
+            keep.push(w);
+        }
+    }
+    s.waiters = keep;
+    if (s.dirty && now - s.saved_ms >= SAVE_EVERY_MS) {
+        save(s);
+    }
+}
+
+fn view_of(s: State) -> model.View {
+    let now = time.now();
+    var healthy: [model.Instance] = [];
+    var services: [string] = [];
+    for k in sort(s.instances.keys()) {
+        let i = s.instances.get(k).unwrap();
+        if (!services.contains(i.service)) {
+            services.push(i.service);
+        }
+        if (model.healthy(i, now)) {
+            healthy.push(i);
+        }
+    }
+    model.View { index: s.index, healthy: healthy, services: services }
+}
+
+fn push_view(s: State) {
+    let v = view_of(s);
+    for ch in s.subscribers {
+        send(ch, v);
+    }
+    s.view_stale = false;
+}
+
+fn summaries(s: State) -> [Summary] {
+    let now = time.now();
+    let by: Map<string, Summary> = Map.new();
+    for k in s.instances.keys() {
+        let i = s.instances.get(k).unwrap();
+        let sum = by.get_or(
+            i.service,
+            Summary {
+                name: i.service,
+                instances: 0,
+                passing: 0,
+                index: service_index(s, i.service)
+            }
+        );
+        sum.instances = sum.instances + 1;
+        if (model.healthy(i, now)) {
+            sum.passing = sum.passing + 1;
+        }
+        by.insert(i.service, sum);
+    }
+    sort(by.keys()).map(fn(n: string) -> Summary { by.get(n).unwrap() })
+}
+
+// --- Persistence: the whole registry as JSON, replaced atomically ---
+
+fn jstr(s: string) -> json.Json {
+    json.Json.JStr(s)
+}
+
+fn jint(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+pub fn instance_json(i: model.Instance) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    m.insert("service", jstr(i.service));
+    m.insert("id", jstr(i.id));
+    m.insert("address", jstr(i.address));
+    m.insert("port", jint(i.port));
+    m.insert("tags", json.Json.JArray(i.tags.map(jstr)));
+    m.insert("ttl_ms", jint(i.ttl_ms));
+    m.insert("expires_ms", jint(i.expires_ms));
+    m.insert("check_kind", jstr(i.check.kind));
+    m.insert("check_target", jstr(i.check.target));
+    m.insert("check_interval_ms", jint(i.check.interval_ms));
+    m.insert("check_timeout_ms", jint(i.check.timeout_ms));
+    m.insert("check_ok", json.Json.JBool(i.check_ok));
+    m.insert("check_output", jstr(i.check_output));
+    m.insert("critical_since_ms", jint(i.critical_since_ms));
+    m.insert("registered_ms", jint(i.registered_ms));
+    json.Json.JObject(m)
+}
+
+fn instance_of(j: json.Json) -> Option<model.Instance> {
+    var tags: [string] = [];
+    for t in json.get_array(j, "tags").unwrap_or([]) {
+        tags.push(json.as_string(t).unwrap_or(""));
+    }
+    Option.Some(
+        model.Instance {
+            service: json.get_string(j, "service")?,
+            id: json.get_string(j, "id")?,
+            address: json.get_string(j, "address")?,
+            port: json.get_int(j, "port")?,
+            tags: tags,
+            ttl_ms: json.get_int(j, "ttl_ms").unwrap_or(0),
+            expires_ms: json.get_int(j, "expires_ms").unwrap_or(0),
+            check: model.Check {
+                kind: json.get_string(j, "check_kind").unwrap_or(""),
+                target: json.get_string(j, "check_target").unwrap_or(""),
+                interval_ms: json.get_int(j, "check_interval_ms").unwrap_or(10000),
+                timeout_ms: json.get_int(j, "check_timeout_ms").unwrap_or(2000)
+            },
+            check_ok: json.get_bool(j, "check_ok").unwrap_or(false),
+            check_output: json.get_string(j, "check_output").unwrap_or(""),
+            critical_since_ms: json.get_int(j, "critical_since_ms").unwrap_or(0),
+            registered_ms: json.get_int(j, "registered_ms").unwrap_or(0)
+        }
+    )
+}
+
+fn save(s: State) {
+    if (s.path == "") {
+        return;
+    }
+    let m: Map<string, json.Json> = Map.new();
+    m.insert("index", jint(s.index));
+    var xs: [json.Json] = [];
+    for k in sort(s.instances.keys()) {
+        xs.push(instance_json(s.instances.get(k).unwrap()));
+    }
+    m.insert("instances", json.Json.JArray(xs));
+    let tmp = s.path + ".tmp";
+    match (write_synced(tmp, json.stringify_pretty(json.Json.JObject(m), 2))) {
+        Result.Ok(_) => {
+            fs.rename(tmp, s.path);
+            s.dirty = false;
+            s.saved_ms = time.now();
+        },
+        Result.Err(e) => eprint("raydns: could not save ${s.path}: ${e}"),
+    }
+}
+
+fn write_synced(path: string, text: string) -> Result<int, string> {
+    let h = fs.open(path, "w")?;
+    let r = fs.write(h, text);
+    let synced = fs.sync_data(h);
+    close(h);
+    r?;
+    synced
+}
+
+fn load(path: string) -> Result<(int, [model.Instance]), string> {
+    let j = json.parse(fs.read_file(path)?).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    var xs: [model.Instance] = [];
+    for it in json.get_array(j, "instances").unwrap_or([]) {
+        match (instance_of(it)) {
+            Option.Some(i) => xs.push(i),
+            Option.None => return Result.Err("${path}: a malformed instance"),
+        }
+    }
+    Result.Ok((json.get_int(j, "index").unwrap_or(0), xs))
+}
+
+// --- The client side ---
+
+fn wait_index(r: Channel<Result<int, string>>) -> Result<int, string> {
+    recv(r).unwrap_or(Result.Err("registry stopped"))
+}
+
+pub fn ask_register(reg: Channel<Msg>, i: model.Instance) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(reg, Msg.Register(i, r));
+    wait_index(r)
+}
+
+pub fn ask_renew(reg: Channel<Msg>, service: string, id: string) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(reg, Msg.Renew(service, id, r));
+    wait_index(r)
+}
+
+pub fn ask_deregister(reg: Channel<Msg>, service: string, id: string) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(reg, Msg.Deregister(service, id, r));
+    wait_index(r)
+}
+
+/// The instances of `service` once its index is past `index` (or now, with 0), waiting at most
+/// `wait_ms`.
+pub fn ask_get(reg: Channel<Msg>, service: string, index: int, wait_ms: int) -> Reply {
+    let r: Channel<Reply> = Channel.bounded(1);
+    send(reg, Msg.Get(service, index, time.now() + wait_ms, r));
+    recv(r).unwrap_or(Reply { index: 0, instances: [] })
+}
+
+pub fn ask_services(reg: Channel<Msg>) -> [Summary] {
+    let r: Channel<[Summary]> = Channel.bounded(1);
+    send(reg, Msg.Services(r));
+    recv(r).unwrap_or([])
+}
+
+pub fn subscribe(reg: Channel<Msg>) -> Channel<model.View> {
+    let ch: Channel<model.View> = Channel.new();
+    send(reg, Msg.Subscribe(ch));
+    ch
+}
+
+pub fn snapshot(reg: Channel<Msg>) -> model.View {
+    let ch: Channel<model.View> = Channel.bounded(1);
+    send(reg, Msg.Snapshot(ch));
+    recv(ch).unwrap_or(model.View { index: 0, healthy: [], services: [] })
+}
+
+pub fn stop(reg: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(reg, Msg.Stop(r));
+    recv(r);
+}

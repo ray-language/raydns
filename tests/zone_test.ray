@@ -1,0 +1,147 @@
+// The resolver on its own: every name form, tags, SRV with additional addresses, static
+// records and CNAME chasing, NXDOMAIN vs NODATA, and names outside the zone.
+
+import config;
+import model;
+import wire;
+import zone;
+
+const SRC: string = `
+[server]
+zone = "Ray.Internal."
+
+[[record]]
+name = "www"
+type = "CNAME"
+value = "web.service.ray.internal"
+
+[[record]]
+name = "@"
+type = "TXT"
+value = "v=spf1 -all"
+
+[[record]]
+name = "db.legacy"
+type = "A"
+value = "10.9.9.9"
+`;
+
+fn inst(service: string, id: string, address: string, port: int, tags: [string]) -> model.Instance {
+    model.Instance {
+        service: service,
+        id: id,
+        address: address,
+        port: port,
+        tags: tags,
+        ttl_ms: 0,
+        expires_ms: 0,
+        check: model.no_check(),
+        check_ok: true,
+        check_output: "",
+        critical_since_ms: 0,
+        registered_ms: 1
+    }
+}
+
+fn setup() -> (zone.Zone, model.View) {
+    let z = zone.of(config.parse(SRC).unwrap());
+    let v = model.View {
+        index: 7,
+        healthy: [
+            inst("web", "w1", "10.0.0.1", 8080, ["v1"]),
+            inst("web", "w2", "10.0.0.2", 8081, ["v2"]),
+            inst("web", "w6", "fd00::2", 8082, ["v2"])
+        ],
+        services: ["web", "empty"]
+    };
+    (z, v)
+}
+
+fn ask(name: string, qtype: int) -> wire.Answer {
+    let (z, v) = setup();
+    zone.resolve(z, v, wire.Question { name: name, qtype: qtype, qclass: wire.IN })
+}
+
+fn addrs(a: wire.Answer) -> [string] {
+    var out: [string] = [];
+    for r in a.answers {
+        match (r.data) {
+            wire.Data.Addr4(o) => out.push(join(o.map(to_string), ".")),
+            wire.Data.Addr6(_) => out.push("v6"),
+            wire.Data.Srv(_, _, port, target) => out.push("${port} ${target}"),
+            wire.Data.Name(n) => out.push("-> ${n}"),
+            wire.Data.Txt(t) => out.push(join(t, "")),
+            _ => out.push(wire.type_name(r.rtype)),
+        }
+    }
+    sort(out)
+}
+
+@test
+fn services_by_name_and_tag() {
+    let a = ask("WEB.service.ray.internal", wire.A);
+    assert_eq((a.rcode, a.authoritative), (wire.NOERROR, true));
+    assert_eq(addrs(a), ["10.0.0.1", "10.0.0.2"]);
+    assert_eq(addrs(ask("web.service.ray.internal", wire.AAAA)), ["v6"]);
+    assert_eq(addrs(ask("v2.web.service.ray.internal", wire.A)), ["10.0.0.2"]);
+    let srv = ask("_web._tcp.service.ray.internal", wire.SRV);
+    assert_eq(
+        addrs(srv),
+        [
+            "8080 w1.web.instance.ray.internal",
+            "8081 w2.web.instance.ray.internal",
+            "8082 w6.web.instance.ray.internal"
+        ]
+    );
+    assert_eq(srv.additional.len(), 3);
+    assert_eq(
+        addrs(ask("_web._v1.service.ray.internal", wire.SRV)),
+        ["8080 w1.web.instance.ray.internal"]
+    );
+    assert_eq(addrs(ask("w2.web.instance.ray.internal", wire.A)), ["10.0.0.2"]);
+}
+
+@test
+fn nodata_and_nxdomain() {
+    // A known service with nobody healthy: the name exists, no records.
+    let empty = ask("empty.service.ray.internal", wire.A);
+    assert_eq((empty.rcode, empty.answers.len(), empty.authority.len()), (wire.NOERROR, 0, 1));
+    let none = ask("nope.service.ray.internal", wire.A);
+    assert_eq((none.rcode, none.authority.len()), (wire.NXDOMAIN, 1));
+    assert_eq(ask("service.ray.internal", wire.A).rcode, wire.NOERROR);
+    assert_eq(ask("legacy.ray.internal", wire.A).rcode, wire.NOERROR);
+    assert_eq(ask("other.ray.internal", wire.A).rcode, wire.NXDOMAIN);
+    assert_eq(ask("w9.web.instance.ray.internal", wire.A).rcode, wire.NOERROR);
+    assert_eq(ask("example.com", wire.A).rcode, wire.REFUSED);
+    assert_eq(ask("evilray.internal", wire.A).rcode, wire.REFUSED);
+}
+
+@test
+fn static_records_and_the_apex() {
+    let www = ask("www.ray.internal", wire.A);
+    assert_eq(addrs(www), ["-> web.service.ray.internal", "10.0.0.1", "10.0.0.2"]);
+    assert_eq(addrs(ask("www.ray.internal", wire.CNAME)), ["-> web.service.ray.internal"]);
+    assert_eq(addrs(ask("db.legacy.ray.internal", wire.A)), ["10.9.9.9"]);
+    assert_eq(addrs(ask("ray.internal", wire.TXT)), ["v=spf1 -all"]);
+    let soa = ask("ray.internal", wire.SOA);
+    match (soa.answers[0].data) {
+        wire.Data.Soa(mname, _, serial, _, _, _, _) => assert_eq((mname, serial), ("ns.ray.internal", 7)),
+        _ => assert(false),
+    }
+    let ns = ask("ray.internal", wire.NS);
+    assert_eq((ns.answers.len(), ns.additional.len()), (1, 1));
+    assert_eq(addrs(ask("ns.ray.internal", wire.A)), ["127.0.0.1"]);
+}
+
+@test
+fn config_errors() {
+    assert(config.parse("[[record]]\nname = \"x\"\ntype = \"A\"\nvalue = \"nope\"\n").is_err());
+    assert(config.parse("[[record]]\nname = \"x\"\ntype = \"PTR\"\nvalue = \"a\"\n").is_err());
+    assert(config.parse("[server]\nadvertise = \"localhost\"\n").is_err());
+    assert(
+        model.valid_label("api-v2")
+            && !model.valid_label("Api")
+            && !model.valid_label("a.b")
+            && !model.valid_label("-a")
+    );
+}

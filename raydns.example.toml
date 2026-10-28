@@ -1,0 +1,28 @@
+# raydns configuration. Copy to raydns.toml.
+
+[server]
+dns = "127.0.0.1:8600"          # UDP and TCP, same port
+http = "127.0.0.1:8500"         # the registry API
+zone = "ray.internal"
+advertise = "127.0.0.1"         # the address of ns.<zone>
+ttl = 5                         # seconds, for service answers
+deregister_after = 60           # seconds an unhealthy instance stays listed
+receivers = 2                   # UDP fibers on the DNS socket (2 was the fastest here)
+state = "raydns.state.json"     # where the registry is saved ("" = nowhere)
+token = ""                      # bearer token for PUT/DELETE ("" = open)
+
+# Static records, relative to the zone; "@" is the zone itself.
+[[record]]
+name = "www"
+type = "CNAME"
+value = "web.service.ray.internal"
+
+[[record]]
+name = "@"
+type = "TXT"
+value = "v=spf1 -all"
+
+[[record]]
+name = "mail"
+type = "A"
+value = "10.0.0.25"

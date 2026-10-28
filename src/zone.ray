@@ -1,0 +1,278 @@
+//! The authoritative answer to one question, from a view of the registry and the static
+//! records. Pure: the DNS fibers call it with their own copy of the view.
+//!
+//! Names under the zone (`ray.internal` below):
+//!
+//! | name | answers |
+//! |---|---|
+//! | `api.service.ray.internal` | A/AAAA of the healthy `api` instances (SRV too) |
+//! | `v2.api.service.ray.internal` | the same, only those tagged `v2` |
+//! | `_api._tcp.service.ray.internal` | SRV (port + target), target addresses as additional |
+//! | `_api._v2.service.ray.internal` | SRV of the instances tagged `v2` |
+//! | `a1.api.instance.ray.internal` | the address of instance `a1` of `api` |
+//! | `ray.internal`, `ns.ray.internal` | SOA, NS and the server's own address |
+//! | anything in `[[record]]` | as written (A, AAAA, CNAME, TXT, MX) |
+
+import std/random;
+import config;
+import model;
+import wire;
+
+pub struct Zone {
+    name: string,
+    advertise: string,
+    ttl: int,
+    records: [config.Static],
+}
+
+pub fn of(c: config.Config) -> Zone {
+    Zone { name: c.zone, advertise: c.advertise, ttl: c.ttl, records: c.records }
+}
+
+const NEG_TTL: int = 5;
+
+fn soa(z: Zone, serial: int) -> wire.Rr {
+    wire.Rr {
+        name: z.name,
+        rtype: wire.SOA,
+        ttl: NEG_TTL,
+        data: wire.Data.Soa(
+            "ns.${z.name}",
+            "hostmaster.${z.name}",
+            if (serial < 1) { 1 } else { serial },
+            3600,
+            600,
+            86400,
+            NEG_TTL
+        )
+    }
+}
+
+fn addr_rr(name: string, address: string, ttl: int) -> Option<wire.Rr> {
+    match (wire.parse_ipv4(address)) {
+        Option.Some(o) => return Option.Some(wire.Rr { name: name, rtype: wire.A, ttl: ttl, data: wire.Data.Addr4(o) }),
+        Option.None => { },
+    }
+    match (wire.parse_ipv6(address)) {
+        Option.Some(o) => Option.Some(wire.Rr { name: name, rtype: wire.AAAA, ttl: ttl, data: wire.Data.Addr6(o) }),
+        Option.None => Option.None,
+    }
+}
+
+fn wants(qtype: int, rtype: int) -> bool {
+    qtype == rtype || qtype == wire.ANY
+}
+
+fn static_rr(r: config.Static) -> wire.Rr {
+    let data = match (r.rtype) {
+        1 => wire.Data.Addr4(wire.parse_ipv4(r.value).unwrap_or([0, 0, 0, 0])),
+        28 => wire.Data.Addr6(wire.parse_ipv6(r.value).unwrap_or([])),
+        5 => wire.Data.Name(r.value.strip_suffix(".").unwrap_or(r.value)),
+        15 => {
+            let parts = r.value.split(" ");
+            wire.Data.Mx(
+                parse_int(parts[0]).unwrap_or(10),
+                parts[1].strip_suffix(".").unwrap_or(parts[1])
+            )
+        },
+        _ => wire.Data.Txt([r.value]),
+    };
+    wire.Rr { name: r.name, rtype: r.rtype, ttl: r.ttl, data: data }
+}
+
+fn target_of(z: Zone, i: model.Instance) -> string {
+    "${i.id}.${i.service}.instance.${z.name}"
+}
+
+/// The answer to `q` (its name already as the client wrote it; matching ignores case).
+pub fn resolve(z: Zone, v: model.View, q: wire.Question) -> wire.Answer {
+    if (q.qclass != wire.IN && q.qclass != wire.ANY) {
+        return wire.empty(wire.REFUSED);
+    }
+    let name = q.name.to_lower();
+    if (name != z.name && !name.ends_with("." + z.name)) {
+        // Not ours, and we do not recurse.
+        return wire.empty(wire.REFUSED);
+    }
+    var a = lookup(z, v, name, q.qtype, 0);
+    a.authoritative = true;
+    if (a.rcode == wire.NXDOMAIN || (a.rcode == wire.NOERROR && a.answers.len() == 0)) {
+        a.authority = [soa(z, v.index)];
+    }
+    a
+}
+
+fn answer(rcode: int, answers: [wire.Rr], additional: [wire.Rr]) -> wire.Answer {
+    wire.Answer {
+        rcode: rcode,
+        authoritative: true,
+        answers: answers,
+        authority: [],
+        additional: additional
+    }
+}
+
+fn lookup(z: Zone, v: model.View, name: string, qtype: int, depth: int) -> wire.Answer {
+    // Static records first: they may also shadow a generated name.
+    var found = false;
+    var answers: [wire.Rr] = [];
+    for r in z.records {
+        if (r.name == name) {
+            found = true;
+            if (r.rtype == wire.CNAME && qtype != wire.CNAME) {
+                // A CNAME stands alone; follow it once when it stays in the zone.
+                let c = static_rr(r);
+                let target = r.value.to_lower().strip_suffix(".").unwrap_or(r.value.to_lower());
+                if (depth < 4 && (target == z.name || target.ends_with("." + z.name))) {
+                    let more = lookup(z, v, target, qtype, depth + 1);
+                    return answer(wire.NOERROR, [c] + more.answers, more.additional);
+                }
+                return answer(wire.NOERROR, [c], []);
+            }
+            if (wants(qtype, r.rtype)) {
+                answers.push(static_rr(r));
+            }
+        }
+    }
+    if (found && name != z.name) {
+        return answer(wire.NOERROR, answers, []);
+    }
+    if (name == z.name) {
+        // The apex: its SOA and NS, plus whatever static records it has.
+        var out: [wire.Rr] = answers;
+        if (wants(qtype, wire.SOA)) {
+            out.push(soa(z, v.index));
+        }
+        if (wants(qtype, wire.NS)) {
+            out.push(
+                wire.Rr {
+                    name: z.name,
+                    rtype: wire.NS,
+                    ttl: 3600,
+                    data: wire.Data.Name("ns.${z.name}")
+                }
+            );
+        }
+        let extra = if (wants(qtype, wire.NS)) { own_address(z, wire.ANY) } else { [] };
+        return answer(wire.NOERROR, out, extra);
+    }
+    let rel = name.substring(0, name.len() - z.name.len() - 1);
+    if (rel == "ns") {
+        return answer(wire.NOERROR, own_address(z, qtype), []);
+    }
+    // An empty non-terminal: the parent of a static name exists.
+    for r in z.records {
+        if (r.name.ends_with("." + name)) {
+            return answer(wire.NOERROR, [], []);
+        }
+    }
+    let labels = rel.split(".");
+    let kind = labels[labels.len() - 1];
+    if (kind == "service") {
+        return service(z, v, labels.slice(0, labels.len() - 1), name, qtype);
+    }
+    if (kind == "instance") {
+        if (labels.len() == 1) {
+            return answer(wire.NOERROR, [], []);
+        }
+        if (labels.len() == 3) {
+            for i in v.healthy {
+                if (i.id == labels[0] && i.service == labels[1]) {
+                    return answer(wire.NOERROR, addresses_of(name, [i], qtype, z.ttl), []);
+                }
+            }
+            if (v.services.contains(labels[1])) {
+                // Known service, unknown or unhealthy instance: the name may come back.
+                return answer(wire.NOERROR, [], []);
+            }
+        }
+    }
+    answer(wire.NXDOMAIN, [], [])
+}
+
+fn own_address(z: Zone, qtype: int) -> [wire.Rr] {
+    match (addr_rr("ns.${z.name}", z.advertise, 3600)) {
+        Option.Some(r) => if (wants(qtype, r.rtype)) { [r] } else { [] },
+        Option.None => [],
+    }
+}
+
+fn addresses_of(name: string, xs: [model.Instance], qtype: int, ttl: int) -> [wire.Rr] {
+    var out: [wire.Rr] = [];
+    for i in xs {
+        match (addr_rr(name, i.address, ttl)) {
+            Option.Some(r) => if (wants(qtype, r.rtype)) {
+                out.push(r);
+            },
+            Option.None => { },
+        }
+    }
+    out
+}
+
+fn srv_of(z: Zone, name: string, xs: [model.Instance]) -> ([wire.Rr], [wire.Rr]) {
+    var answers: [wire.Rr] = [];
+    var extra: [wire.Rr] = [];
+    for i in xs {
+        let target = target_of(z, i);
+        answers.push(
+            wire.Rr {
+                name: name,
+                rtype: wire.SRV,
+                ttl: z.ttl,
+                data: wire.Data.Srv(1, 1, i.port, target)
+            }
+        );
+        match (addr_rr(target, i.address, z.ttl)) {
+            Option.Some(r) => extra.push(r),
+            Option.None => { },
+        }
+    }
+    (answers, extra)
+}
+
+// `labels` is what comes before `.service`: [svc], [tag, svc], or [_svc, _tag].
+fn service(z: Zone, v: model.View, labels: [string], name: string, qtype: int) -> wire.Answer {
+    if (labels.len() == 0) {
+        return answer(wire.NOERROR, [], []);
+    }
+    var svc = "";
+    var tag = "";
+    var srv_form = false;
+    if (labels.len() == 1) {
+        svc = labels[0];
+    } else if (labels.len() == 2 && labels[0].starts_with("_") && labels[1].starts_with("_")) {
+        svc = labels[0].substring(1, labels[0].len());
+        let t = labels[1].substring(1, labels[1].len());
+        tag = if (t == "tcp" || t == "udp") { "" } else { t };
+        srv_form = true;
+    } else if (labels.len() == 2) {
+        tag = labels[0];
+        svc = labels[1];
+    } else {
+        return answer(wire.NXDOMAIN, [], []);
+    }
+    if (!v.services.contains(svc)) {
+        return answer(wire.NXDOMAIN, [], []);
+    }
+    var xs: [model.Instance] = [];
+    for i in v.healthy {
+        if (i.service == svc && (tag == "" || i.tags.contains(tag))) {
+            xs.push(i);
+        }
+    }
+    // A different order on every answer spreads the clients over the instances.
+    random.shuffle(xs);
+    if (srv_form) {
+        if (!wants(qtype, wire.SRV)) {
+            return answer(wire.NOERROR, [], []);
+        }
+        let (answers, extra) = srv_of(z, name, xs);
+        return answer(wire.NOERROR, answers, extra);
+    }
+    if (qtype == wire.SRV) {
+        let (answers, extra) = srv_of(z, name, xs);
+        return answer(wire.NOERROR, answers, extra);
+    }
+    answer(wire.NOERROR, addresses_of(name, xs, qtype, z.ttl), [])
+}

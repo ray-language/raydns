@@ -1,0 +1,113 @@
+//! Everything together: the registry fiber, DNS on UDP and TCP (same port), and the HTTP API.
+
+import std/net;
+import net/udp;
+import net/webserver;
+import api;
+import config;
+import dnsd;
+import registry;
+import zone;
+
+pub struct Running {
+    dns_port: int,
+    http_port: int,
+    reg: Channel<registry.Msg>,
+    stop_http: Channel<int>,
+    stop_dns: Channel<int>,
+    dns_done: Channel<dnsd.Stats>,
+    http_done: Channel<Result<int, string>>,
+    udp: int,
+    tcp: int,
+    receivers: int,
+}
+
+const READ_POLL_MS: int = 200;
+
+// UDP and TCP on the same port; with port 0, the port UDP got (tried a few times, in case
+// TCP finds it taken).
+fn bind_dns(host: string, port: int) -> Result<(int, int, int), string> {
+    var tries = 0;
+    while (true) {
+        let u = udp.bind(host, port)?;
+        let p = net.local_port(u);
+        match (net.tcp_listen(host, p)) {
+            Result.Ok(t) => return Result.Ok((u, t, p)),
+            Result.Err(e) => {
+                close(u);
+                tries = tries + 1;
+                if (port != 0 || tries > 5) {
+                    return Result.Err("tcp ${host}:${p}: ${e}");
+                }
+            },
+        }
+    }
+}
+
+pub fn start(cfg: config.Config) -> Result<Running, string> {
+    let reg = registry.start(cfg.state, cfg.deregister_after_ms)?;
+    let (u, t, dns_port) = bind_dns(cfg.dns_host, cfg.dns_port)?;
+    let http = net.tcp_listen(cfg.http_host, cfg.http_port)?;
+    let z = zone.of(cfg);
+    net.set_read_timeout(u, READ_POLL_MS);
+    let stop_dns: Channel<int> = Channel.bounded(1);
+    let dns_done: Channel<dnsd.Stats> = Channel.bounded(cfg.receivers);
+    for _ in 0..cfg.receivers {
+        spawn(fn() {
+            dnsd.receive(u, z, reg, stop_dns, dns_done);
+        });
+    }
+    spawn(fn() {
+        dnsd.accept_tcp(t, z, reg);
+    });
+    let stop_http: Channel<int> = Channel.bounded(1);
+    let http_done: Channel<Result<int, string>> = Channel.bounded(1);
+    let ctx = api.Ctx { cfg: cfg, reg: reg };
+    spawn(fn() {
+        var opts = webserver.options();
+        opts.drain_ms = 2000;
+        opts.stop = stop_http;
+        opts.has_stop = true;
+        opts.no_stdout = true;
+        let r = webserver.serve_options_on(
+            http,
+            opts,
+            fn() -> fn(webserver.Request) -> webserver.Response {
+                fn(req: webserver.Request) -> webserver.Response { api.handle(ctx, req) }
+            }
+        );
+        send(http_done, r);
+    });
+    Result.Ok(
+        Running {
+            dns_port: dns_port,
+            http_port: net.local_port(http),
+            reg: reg,
+            stop_http: stop_http,
+            stop_dns: stop_dns,
+            dns_done: dns_done,
+            http_done: http_done,
+            udp: u,
+            tcp: t,
+            receivers: cfg.receivers
+        }
+    )
+}
+
+/// Stops everything and saves the registry. Returns how many queries the receivers answered.
+pub fn stop(r: Running) -> int {
+    send(r.stop_http, 1);
+    recv(r.http_done);
+    close(r.stop_dns);
+    var queries = 0;
+    for _ in 0..r.receivers {
+        match (recv(r.dns_done)) {
+            Option.Some(st) => queries = queries + st.queries,
+            Option.None => { },
+        }
+    }
+    close(r.tcp);
+    close(r.udp);
+    registry.stop(r.reg);
+    queries
+}
