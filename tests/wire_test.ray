@@ -5,7 +5,7 @@ import net/dns;
 import wire;
 
 fn q_of(name: string, qtype: int) -> wire.Query {
-    wire.parse_query(dns.build_query(4242, name, qtype)).ok().unwrap()
+    wire.parse_query(dns.build_query(4242, name, qtype)).unwrap()
 }
 
 fn rr(name: string, rtype: int, data: wire.Data) -> wire.Rr {
@@ -86,7 +86,7 @@ fn truncation_and_edns() {
     }
     with_opt[11] = 1;
     with_opt = with_opt + [0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0];
-    let eq = wire.parse_query(bytes_of(with_opt)).ok().unwrap();
+    let eq = wire.parse_query(bytes_of(with_opt)).unwrap();
     assert_eq(eq.edns, 4096);
     assert_eq(wire.udp_limit(eq), 1232);
     let roomy = wire.write_response(eq, answer(rs), wire.udp_limit(eq));

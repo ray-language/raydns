@@ -101,7 +101,7 @@ solo sube la latencia), y más de 2 receptoras sobre el mismo socket rinden meno
 
 ## Hallazgos de dogfood
 
-En `../findings/open/raydns-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #286 y #288 arreglados; #287 sigue.
+En `../findings/open/raydns-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #286 y #288 arreglados (el test ya usa `query_a`); #287 sigue.
 
 Lo que se encontró con 1.27.85:
 
