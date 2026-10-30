@@ -16,7 +16,7 @@
 import std/random;
 import config;
 import model;
-import wire;
+import net/dns_message as wire;
 
 pub struct Zone {
     name: string,

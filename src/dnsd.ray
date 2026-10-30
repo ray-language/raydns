@@ -6,7 +6,7 @@ import std/net;
 import net/udp;
 import model;
 import registry;
-import wire;
+import net/dns_message as wire;
 import zone;
 
 /// Counters a receiver keeps and reports when it stops.

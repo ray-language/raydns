@@ -21,7 +21,7 @@
 
 import std/fs;
 import std/toml;
-import wire;
+import net/dns_message as wire;
 
 pub struct Static {
     /// Lowercased, absolute, without the final dot.

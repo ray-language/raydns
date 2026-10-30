@@ -20,7 +20,7 @@ import net/webserver;
 import config;
 import model;
 import registry;
-import wire;
+import net/dns_message as wire;
 
 pub struct Ctx {
     cfg: config.Config,

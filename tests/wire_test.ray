@@ -2,7 +2,7 @@
 // compression, truncation, EDNS, broken datagrams and the address parsers.
 
 import net/dns;
-import wire;
+import net/dns_message as wire;
 
 fn q_of(name: string, qtype: int) -> wire.Query {
     wire.parse_query(dns.build_query(4242, name, qtype)).unwrap()

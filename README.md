@@ -62,9 +62,11 @@ src/checks.ray    los health checks, una fibra por instancia
 src/api.ray       el API HTTP (JSON)
 src/dnsd.ray      las receptoras UDP y las conexiones TCP
 src/zone.ray      la respuesta a una pregunta (puro)
-src/wire.ray      el formato de DNS: leer preguntas, escribir respuestas comprimidas
 src/bench.ray     el generador de carga
 ```
+
+El formato de DNS (leer preguntas, escribir respuestas comprimidas y truncarlas) es `net/dns_message`,
+desde net 0.14.0; antes raydns traía el suyo (`src/wire.ray`, ~400 líneas, que pasó a `net`).
 
 - **Una fibra es dueña del registro.** El API le pregunta por un canal; cada cambio (alta, baja, una
   instancia que pasa a sana o a crítica) sube un índice global y el del servicio. Renovar un lease
@@ -101,7 +103,7 @@ solo sube la latencia), y más de 2 receptoras sobre el mismo socket rinden meno
 
 ## Hallazgos de dogfood
 
-En `../findings/open/raydns-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #286 y #288 arreglados (el test ya usa `query_a`); #287 sigue.
+En `../findings/closed/2026-10/raydns-1.27.85.md`. Re-medido con 1.27.86 y net 0.13.0: #286 y #288 arreglados (el test ya usa `query_a`). Con net 0.14.0, #287 también: raydns usa `net/dns_message`.
 
 Lo que se encontró con 1.27.85:
 

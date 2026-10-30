@@ -3,7 +3,7 @@
 
 import config;
 import model;
-import wire;
+import net/dns_message as wire;
 import zone;
 
 const SRC: string = `
